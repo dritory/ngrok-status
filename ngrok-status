@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_DIR="${HOME}/.config/ngrok-status"
+CONFIG_FILE="${CONFIG_DIR}/config"
+ADDRS_URL="https://api.ngrok.com/reserved_addrs"
+ENDPOINTS_URL="https://api.ngrok.com/endpoints"
+
+# --- clipboard helper ---
+
+clip_copy() {
+    local text="$1"
+    if command -v wl-copy &>/dev/null; then
+        printf '%s' "$text" | wl-copy
+    elif command -v xclip &>/dev/null; then
+        printf '%s' "$text" | xclip -selection clipboard
+    elif command -v xsel &>/dev/null; then
+        printf '%s' "$text" | xsel --clipboard --input
+    elif command -v pbcopy &>/dev/null; then
+        printf '%s' "$text" | pbcopy
+    else
+        return 1
+    fi
+}
+
+# --- config helpers ---
+
+config_load() {
+    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+}
+
+config_set() {
+    mkdir -p "$CONFIG_DIR"
+    local key="$1" value="$2"
+    if [[ -f "$CONFIG_FILE" ]] && grep -q "^${key}=" "$CONFIG_FILE"; then
+        sed -i "s|^${key}=.*|${key}=\"${value}\"|" "$CONFIG_FILE"
+    else
+        echo "${key}=\"${value}\"" >> "$CONFIG_FILE"
+    fi
+}
+
+config_get() {
+    config_load
+    local key="${1:-}"
+    if [[ -z "$key" ]]; then
+        if [[ -f "$CONFIG_FILE" ]]; then
+            while IFS='=' read -r k v; do
+                [[ -z "$k" || "$k" == \#* ]] && continue
+                v="${v//\"/}"
+                if [[ "$k" == "api_key" && -n "$v" ]]; then
+                    echo "${k} = ${v:0:4}***${v: -4}"
+                else
+                    echo "${k} = ${v}"
+                fi
+            done < "$CONFIG_FILE"
+        else
+            echo "No config file found. Run: ngrok-status config set api_key <key>"
+        fi
+    else
+        local val="${!key:-}"
+        if [[ "$key" == "api_key" && -n "$val" ]]; then
+            echo "${key} = ${val:0:4}***${val: -4}"
+        else
+            echo "${key} = ${val:-<unset>}"
+        fi
+    fi
+}
+
+get_api_key() {
+    config_load
+    local key="${NGROK_API_KEY:-${api_key:-}}"
+    if [[ -z "$key" ]]; then
+        echo "Error: ngrok API key not configured." >&2
+        echo "Run:  ngrok-status config set api_key <your-key>" >&2
+        echo "Get your API key from https://dashboard.ngrok.com/api-keys" >&2
+        exit 1
+    fi
+    echo "$key"
+}
+
+# --- watch TUI ---
+
+watch_tui() {
+    for cmd in curl jq tput; do
+        if ! command -v "$cmd" &>/dev/null; then
+            echo "Error: $cmd is required. Install it and try again." >&2
+            exit 1
+        fi
+    done
+
+    local token
+    token="$(get_api_key)"
+    config_load
+    local interval="${refresh_interval:-5}"
+
+    cleanup() { tput cnorm; tput sgr0; echo; }
+    trap cleanup EXIT
+    trap 'exit 0' INT TERM
+
+    tput civis  # hide cursor
+    tput clear
+
+    local sel=0
+    local line_count=0
+    local status_msg=""
+    local status_expire=0
+    local needs_redraw=1
+
+    fetch_data() {
+        lines=()
+        error=""
+
+        local http_code
+
+        # fetch reserved addresses
+        response="$(curl -s --max-time 10 -w '\n%{http_code}' \
+            -H "Authorization: Bearer ${token}" \
+            -H "ngrok-version: 2" \
+            "$ADDRS_URL" 2>&1)"
+        http_code="${response##*$'\n'}"
+        response="${response%$'\n'*}"
+
+        if [[ "$http_code" -ne 200 ]] 2>/dev/null; then
+            local detail
+            detail="$(echo "$response" | jq -r '.msg // .message // empty' 2>/dev/null)"
+            error="API request failed (HTTP ${http_code})${detail:+: ${detail}}"
+            return
+        fi
+
+        # fetch active endpoints
+        local endpoints_response="" endpoints_http=""
+        endpoints_response="$(curl -s --max-time 10 -w '\n%{http_code}' \
+            -H "Authorization: Bearer ${token}" \
+            -H "ngrok-version: 2" \
+            "$ENDPOINTS_URL" 2>&1)"
+        endpoints_http="${endpoints_response##*$'\n'}"
+        endpoints_response="${endpoints_response%$'\n'*}"
+
+        if [[ "$endpoints_http" -ne 200 ]] 2>/dev/null; then
+            endpoints_response=""
+        fi
+
+        # build list of connected reserved addr IDs
+        local connected_ids=""
+        if [[ -n "$endpoints_response" ]]; then
+            connected_ids="$(echo "$endpoints_response" | jq -r '
+                [.endpoints[] | .tcp_addr.id // empty] | unique | join("\n")
+            ')"
+        fi
+
+        mapfile -t lines < <(echo "$response" | jq -r --arg ids "$connected_ids" '
+            ($ids | split("\n")) as $connected |
+            .reserved_addrs[] |
+            (.id // "") as $id |
+            (if ($connected | index($id)) then "●" else "○" end) as $status |
+            [$status, .description // "—", .addr // "", .region // ""] | @tsv
+        ')
+
+        line_count=${#lines[@]}
+        if (( sel >= line_count )); then
+            sel=$(( line_count > 0 ? line_count - 1 : 0 ))
+        fi
+    }
+
+    draw() {
+        local buf=""
+        local cols
+        cols="$(tput cols)"
+        local ts
+        ts="$(date +%H:%M:%S)"
+        local header=" ngrok TCP Addresses  —  refreshed ${ts}  —  every ${interval}s "
+
+        buf+="$(tput rev; tput bold)"
+        buf+="$(printf "%-${cols}s" "$header")"
+        buf+="$(tput sgr0)"$'\n'
+
+        if [[ -n "$error" ]]; then
+            buf+=$'\n'"  $error"
+        elif [[ ${#lines[@]} -eq 0 ]]; then
+            buf+=$'\n'"  No TCP addresses found."
+        else
+            buf+=$'\n'
+            buf+="$(tput bold)"
+            buf+="$(printf "     %-30s  %-25s  %s" "DESCRIPTION" "ADDRESS" "REGION")"
+            buf+="$(tput sgr0)"$'\n'
+            buf+="$(printf " %s" "$(printf '─%.0s' $(seq 1 65))")"$'\n'
+
+            local i=0
+            for line in "${lines[@]}"; do
+                IFS=$'\t' read -r status desc addr region <<< "$line"
+                local row
+                if (( i == sel )); then
+                    if [[ "$status" == "●" ]]; then
+                        row="$(printf " \033[32m%-3s\033[0m\033[7m %-30s  %-25s  %s\033[0m\033[K" "$status" "$desc" "$addr" "$region")"
+                    else
+                        row="$(printf " \033[90m%-3s\033[0m\033[7m %-30s  %-25s  %s\033[0m\033[K" "$status" "$desc" "$addr" "$region")"
+                    fi
+                else
+                    if [[ "$status" == "●" ]]; then
+                        row="$(printf " \033[32m%-3s\033[0m %-30s  %-25s  %s\033[K" "$status" "$desc" "$addr" "$region")"
+                    else
+                        row="$(printf " \033[90m%-3s\033[0m %-30s  %-25s  %s\033[K" "$status" "$desc" "$addr" "$region")"
+                    fi
+                fi
+                buf+="${row}"$'\n'
+                (( i++ )) || true
+            done
+
+            buf+=$'\n'
+            buf+="$(tput dim)"
+            buf+=" ${#lines[@]} address(es)"
+            buf+="$(tput sgr0)"
+        fi
+
+        buf+=$'\n\n'
+        # status message or help
+        if [[ -n "$status_msg" ]] && (( SECONDS < status_expire )); then
+            buf+=" \033[33m${status_msg}\033[0m"
+        else
+            status_msg=""
+            buf+="$(tput dim)"
+            buf+=" ↑/↓ navigate  c copy address  s copy ssh cmd  q quit"
+            buf+="$(tput sgr0)"
+        fi
+
+        tput home
+        printf '%s' "$buf"
+        tput el; tput ed
+    }
+
+    set_status() {
+        status_msg="$1"
+        status_expire=$(( SECONDS + 3 ))
+        needs_redraw=1
+    }
+
+    get_selected_addr() {
+        if (( line_count > 0 )); then
+            IFS=$'\t' read -r _ _ addr _ <<< "${lines[$sel]}"
+            echo "$addr"
+        fi
+    }
+
+    handle_key() {
+        local key="$1"
+        case "$key" in
+            q|Q) exit 0 ;;
+            A)  # up arrow (escape sequence: \e[A — \e and [ already consumed)
+                if (( sel > 0 )); then
+                    (( sel-- ))
+                    needs_redraw=1
+                fi
+                ;;
+            B)  # down arrow
+                if (( sel < line_count - 1 )); then
+                    (( sel++ )) || true
+                    needs_redraw=1
+                fi
+                ;;
+            k)  # vim up
+                if (( sel > 0 )); then
+                    (( sel-- ))
+                    needs_redraw=1
+                fi
+                ;;
+            j)  # vim down
+                if (( sel < line_count - 1 )); then
+                    (( sel++ )) || true
+                    needs_redraw=1
+                fi
+                ;;
+            c|C)
+                local addr
+                addr="$(get_selected_addr)"
+                if [[ -n "$addr" ]]; then
+                    if clip_copy "$addr"; then
+                        set_status "Copied: ${addr}"
+                    else
+                        set_status "No clipboard tool found (install xclip, xsel, or wl-copy)"
+                    fi
+                fi
+                ;;
+            s|S)
+                local addr
+                addr="$(get_selected_addr)"
+                if [[ -n "$addr" ]]; then
+                    local host port
+                    host="${addr%%:*}"
+                    port="${addr##*:}"
+                    local user="${ssh_user:-}"
+                    local ssh_cmd="ssh ${user:+${user}@}${host} -p ${port}"
+                    if clip_copy "$ssh_cmd"; then
+                        set_status "Copied: ${ssh_cmd}"
+                    else
+                        set_status "No clipboard tool found (install xclip, xsel, or wl-copy)"
+                    fi
+                fi
+                ;;
+        esac
+    }
+
+    local lines=()
+    local error=""
+    local response
+
+    fetch_data
+    draw
+
+    while true; do
+        # wait for interval, but check for keys every 0.2s
+        local waited=0
+        while (( waited < interval * 5 )); do
+            if read -rsn1 -t 0.2 key 2>/dev/null; then
+                if [[ "$key" == $'\x1b' ]]; then
+                    # read rest of escape sequence
+                    read -rsn2 -t 0.05 seq 2>/dev/null || true
+                    key="${seq: -1}"
+                fi
+                handle_key "$key"
+                if (( needs_redraw )); then
+                    draw
+                    needs_redraw=0
+                fi
+            fi
+            (( waited++ )) || true
+            # clear expired status messages
+            if [[ -n "$status_msg" ]] && (( SECONDS >= status_expire )); then
+                status_msg=""
+                draw
+            fi
+        done
+
+        fetch_data
+        needs_redraw=1
+        draw
+        needs_redraw=0
+    done
+}
+
+# --- CLI ---
+
+usage() {
+    cat <<'EOF'
+Usage: ngrok-status [command]
+
+Commands:
+  watch                  Launch the live TUI dashboard (default)
+  config set <key> <val> Set a config value
+  config get [key]       Show config values
+  config path            Print config file path
+
+Config keys:
+  api_key                Your ngrok API key
+  refresh_interval       Refresh interval in seconds (default: 5)
+  ssh_user               Default SSH username for the 's' shortcut
+EOF
+}
+
+case "${1:-watch}" in
+    watch)
+        watch_tui
+        ;;
+    config)
+        case "${2:-}" in
+            set)
+                [[ -z "${3:-}" || -z "${4:-}" ]] && { echo "Usage: ngrok-status config set <key> <value>" >&2; exit 1; }
+                config_set "$3" "$4"
+                echo "$3 set."
+                ;;
+            get)
+                config_get "${3:-}"
+                ;;
+            path)
+                echo "$CONFIG_FILE"
+                ;;
+            *)
+                usage
+                ;;
+        esac
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        usage
+        exit 1
+        ;;
+esac
