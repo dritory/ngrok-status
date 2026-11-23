@@ -16,8 +16,20 @@ sudo apt install curl jq xclip
 ## Install
 
 ```bash
-sudo cp ngrok-status /usr/local/bin/
+curl -fsSL https://raw.githubusercontent.com/dritory/ngrok-status/main/install.sh | bash
 ```
+
+This puts the script in `~/.local/bin`, which needs no sudo. If `ngrok-status` is already installed somewhere else on your PATH, that copy is replaced where it is (with sudo if the directory needs it). The installer also tells you which dependencies are missing and how to install them. Set `NGROK_STATUS_INSTALL_DIR` to choose the directory yourself.
+
+## Update
+
+```bash
+ngrok-status update
+```
+
+While the TUI runs, it checks now and then whether a newer version has been published, and shows a line under the header when there is one. `ngrok-status version` does the same check. To turn it off, run `ngrok-status config set check_updates false`.
+
+If you work on the tool itself, symlink your checkout instead (`ln -s "$PWD/ngrok-status" ~/.local/bin/ngrok-status`). The installer leaves a symlink alone.
 
 ## Setup
 

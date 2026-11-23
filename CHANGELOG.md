@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0 — 2026-11-23
+
+### Added
+
+- A one-line installer: `curl -fsSL https://raw.githubusercontent.com/dritory/ngrok-status/main/install.sh | bash`. It installs to `~/.local/bin` without sudo, or replaces an existing copy where it is, and reports missing dependencies.
+- `ngrok-status update`, which runs the installer over the current copy.
+- The TUI checks for a newer version at startup and every 6 hours after that, and shows a notice under the header that says how to update. `ngrok-status version` reports it as well.
+- Config key `check_updates`, to turn the check off.
+
 ## 0.2.0 — 2026-11-23
 
 ### Added
