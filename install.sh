@@ -107,8 +107,7 @@ main() {
 
     if [[ ! -f "${HOME}/.config/ngrok-status/config" && -z "${NGROK_API_KEY:-}" ]]; then
         say ""
-        say "Next, set your API key (from https://dashboard.ngrok.com/api-keys):"
-        say "  ngrok-status config set api_key <your-ngrok-api-key>"
+        say "Next, run ngrok-status. It will ask for your ngrok API key the first time."
     fi
 }
 
