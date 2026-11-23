@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 — 2026-11-23
+
+### Fixed
+
+- The header said "refreshed never" for a moment at startup, before the first fetch had finished. It now leaves the refresh time out until there is one.
+
+This is also the first release published after the update check went in, so it is the first one that a running 0.3.0 will announce.
+
 ## 0.3.0 — 2026-11-23
 
 ### Added
