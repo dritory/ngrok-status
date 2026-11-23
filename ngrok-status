@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+VERSION="0.2.0"
 CONFIG_DIR="${HOME}/.config/ngrok-status"
 CONFIG_FILE="${CONFIG_DIR}/config"
 ADDRS_URL="https://api.ngrok.com/reserved_addrs"
@@ -26,7 +27,9 @@ clip_copy() {
 # --- config helpers ---
 
 config_load() {
-    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+    fi
 }
 
 config_set() {
@@ -78,6 +81,128 @@ get_api_key() {
     echo "$key"
 }
 
+# --- ssh config helpers ---
+
+ssh_config_path() {
+    echo "${ssh_config:-${HOME}/.ssh/config}"
+}
+
+# "bv-Krikkand 2" -> "krikkand-2" (with alias_strip_prefix="bv-").
+# The result is left in REPLY, which saves a subshell per row.
+ssh_alias_for() {
+    local name="$1" prefix="${alias_strip_prefix:-}"
+    if [[ -n "$prefix" ]]; then
+        name="${name#"$prefix"}"
+    fi
+    name="${name,,}"
+    name="${name//[^a-z0-9._-]/-}"
+    while [[ "$name" == *--* ]]; do name="${name//--/-}"; done
+    name="${name#-}"
+    name="${name%-}"
+    REPLY="$name"
+}
+
+# Prints "alias<TAB>host:port" for every Host block in the ssh config.
+ssh_config_list() {
+    local file
+    file="$(ssh_config_path)"
+    [[ -f "$file" ]] || return 0
+    awk '
+        function flush() {
+            if (alias != "" && host != "") print alias "\t" tolower(host) ":" port
+            alias = ""; host = ""; port = 22
+        }
+        {
+            key = tolower($1); sub(/=.*/, "", key)
+            if (key == "host" || key == "match") {
+                flush()
+                if (key == "host" && $2 !~ /[*?!]/) alias = $2
+                next
+            }
+            if (key == "hostname") host = $2
+            if (key == "port") port = $2
+        }
+        END { flush() }
+    ' "$file"
+}
+
+# Points Host <alias> at host:port. An existing block keeps everything except
+# HostName and Port; otherwise a new block is appended. Prints "updated" or "added".
+ssh_config_upsert() {
+    local alias="$1" host="$2" port="$3" user="${4:-}"
+    local file tmp rc=0
+    file="$(ssh_config_path)"
+
+    if [[ ! -e "$file" ]]; then
+        mkdir -p "$(dirname "$file")"
+        ( umask 077; : > "$file" )
+    fi
+
+    tmp="$(mktemp)"
+    awk -v alias="$alias" -v host="$host" -v port="$port" -v user="$user" '
+        function flush_block() {
+            if (!in_target) return
+            if (!seen_host) print indent "HostName " host
+            if (!seen_port) print indent "Port " port
+            printf "%s", pending
+            pending = ""
+            in_target = 0
+        }
+        {
+            last_blank = ($0 ~ /^[ \t]*$/)
+            key = tolower($1); sub(/=.*/, "", key)
+            if (key == "host" || key == "match") {
+                flush_block()
+                if (key == "host") {
+                    for (i = 2; i <= NF; i++) if ($i == alias) in_target = 1
+                    if (in_target) {
+                        found = 1; seen_host = 0; seen_port = 0
+                        indent = "    "; have_indent = 0
+                    }
+                }
+                print; next
+            }
+            if (!in_target) { print; next }
+            # hold back blank lines so that inserted options land above them
+            if (last_blank) { pending = pending $0 "\n"; next }
+            printf "%s", pending; pending = ""
+            match($0, /^[ \t]*/); cur = substr($0, 1, RLENGTH)
+            if (!have_indent) { indent = cur; have_indent = 1 }
+            if (key == "hostname") {
+                if (!seen_host) print cur "HostName " host
+                seen_host = 1; next
+            }
+            if (key == "port") {
+                if (!seen_port) print cur "Port " port
+                seen_port = 1; next
+            }
+            print
+        }
+        END {
+            flush_block()
+            if (!found) {
+                if (NR > 0 && !last_blank) print ""
+                print "Host " alias
+                print "    HostName " host
+                print "    Port " port
+                if (user != "") print "    User " user
+            }
+            exit(found ? 0 : 3)
+        }
+    ' "$file" > "$tmp" || rc=$?
+
+    if (( rc != 0 && rc != 3 )); then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    cp -p "$file" "${file}.ngrok-status.bak"
+    # write through the existing file so that permissions and symlinks survive
+    cat "$tmp" > "$file"
+    rm -f "$tmp"
+    if (( rc == 3 )); then echo "added"; else echo "updated"; fi
+}
+
 # --- watch TUI ---
 
 watch_tui() {
@@ -93,139 +218,265 @@ watch_tui() {
     config_load
     local interval="${refresh_interval:-5}"
 
-    cleanup() { tput cnorm; tput sgr0; echo; }
+    local t_rev t_bold t_dim t_sgr0
+    t_rev="$(tput rev)"; t_bold="$(tput bold)"; t_dim="$(tput dim)"; t_sgr0="$(tput sgr0)"
+    local el=$'\e[K'
+
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    local result_file="${tmp_dir}/result"
+    local fetching=0 fetch_pid="" next_fetch=0 loaded=0
+
+    cleanup() {
+        if [[ -n "$fetch_pid" ]]; then kill "$fetch_pid" 2>/dev/null || true; fi
+        rm -rf "$tmp_dir"
+        tput cnorm; tput sgr0; echo
+    }
     trap cleanup EXIT
     trap 'exit 0' INT TERM
+    trap 'resized=1; needs_redraw=1' WINCH
 
     tput civis  # hide cursor
     tput clear
 
     local sel=0
+    local top=0  # index of the first row shown
     local line_count=0
     local status_msg=""
     local status_expire=0
     local needs_redraw=1
+    # draw runs on every keypress, so it must not fork: everything it needs
+    # (terminal size, timestamp, SSH labels) is worked out ahead of time
+    local resized=1
+    local term_rows=24 term_cols=80
+    local refreshed_at=""
+    local labels=()
+    local -A ssh_alias_by_addr=()
+    local -A ssh_addr_by_alias=()
 
-    fetch_data() {
-        lines=()
-        error=""
+    load_ssh_map() {
+        ssh_alias_by_addr=()
+        ssh_addr_by_alias=()
+        local a t
+        while IFS=$'\t' read -r a t; do
+            [[ -z "$a" ]] && continue
+            # ssh uses the first block that matches, so we do the same
+            [[ -z "${ssh_addr_by_alias[$a]:-}" ]] && ssh_addr_by_alias[$a]="$t"
+            [[ -z "${ssh_alias_by_addr[$t]:-}" ]] && ssh_alias_by_addr[$t]="$a"
+        done < <(ssh_config_list 2>/dev/null || true)
+        return 0
+    }
 
-        local http_code
+    # Talks to the ngrok API and writes the outcome to $1: a first line of
+    # "ok" or "error<TAB>message", followed by one TSV line per address.
+    # This runs in the background, so it must not touch the TUI state.
+    fetch_to_file() {
+        local out="$1" addrs endpoints http_code
 
-        # fetch reserved addresses
-        response="$(curl -s --max-time 10 -w '\n%{http_code}' \
+        # the two requests are independent, so they run side by side
+        curl -s --max-time 10 -w '\n%{http_code}' \
             -H "Authorization: Bearer ${token}" \
             -H "ngrok-version: 2" \
-            "$ADDRS_URL" 2>&1)"
-        http_code="${response##*$'\n'}"
-        response="${response%$'\n'*}"
+            "$ADDRS_URL" > "${out}.addrs" 2>&1 &
+        curl -s --max-time 10 -w '\n%{http_code}' \
+            -H "Authorization: Bearer ${token}" \
+            -H "ngrok-version: 2" \
+            "$ENDPOINTS_URL" > "${out}.endpoints" 2>&1 &
+        wait
 
-        if [[ "$http_code" -ne 200 ]] 2>/dev/null; then
+        addrs="$(< "${out}.addrs")"
+        http_code="${addrs##*$'\n'}"
+        addrs="${addrs%$'\n'*}"
+
+        if [[ "$http_code" != 200 ]]; then
             local detail
-            detail="$(echo "$response" | jq -r '.msg // .message // empty' 2>/dev/null)"
-            error="API request failed (HTTP ${http_code})${detail:+: ${detail}}"
-            return
+            detail="$(jq -r '.msg // .message // empty' <<< "$addrs" 2>/dev/null || true)"
+            printf 'error\tAPI request failed (HTTP %s)%s\n' "$http_code" "${detail:+: ${detail}}" > "${out}.tmp"
+            mv "${out}.tmp" "$out"
+            return 0
         fi
 
-        # fetch active endpoints
-        local endpoints_response="" endpoints_http=""
-        endpoints_response="$(curl -s --max-time 10 -w '\n%{http_code}' \
-            -H "Authorization: Bearer ${token}" \
-            -H "ngrok-version: 2" \
-            "$ENDPOINTS_URL" 2>&1)"
-        endpoints_http="${endpoints_response##*$'\n'}"
-        endpoints_response="${endpoints_response%$'\n'*}"
-
-        if [[ "$endpoints_http" -ne 200 ]] 2>/dev/null; then
-            endpoints_response=""
-        fi
+        endpoints="$(< "${out}.endpoints")"
+        http_code="${endpoints##*$'\n'}"
+        endpoints="${endpoints%$'\n'*}"
 
         # build list of connected reserved addr IDs
         local connected_ids=""
-        if [[ -n "$endpoints_response" ]]; then
-            connected_ids="$(echo "$endpoints_response" | jq -r '
+        if [[ "$http_code" == 200 ]]; then
+            connected_ids="$(jq -r '
                 [.endpoints[] | .tcp_addr.id // empty] | unique | join("\n")
-            ')"
+            ' <<< "$endpoints" 2>/dev/null || true)"
         fi
 
-        mapfile -t lines < <(echo "$response" | jq -r --arg ids "$connected_ids" '
-            ($ids | split("\n")) as $connected |
-            .reserved_addrs[] |
-            (.id // "") as $id |
-            (if ($connected | index($id)) then "●" else "○" end) as $status |
-            [$status, .description // "—", .addr // "", .region // ""] | @tsv
-        ')
+        {
+            echo "ok"
+            jq -r --arg ids "$connected_ids" '
+                ($ids | split("\n")) as $connected |
+                .reserved_addrs[] |
+                (.id // "") as $id |
+                (if ($connected | index($id)) then "●" else "○" end) as $status |
+                [$status, .description // "—", .addr // "", .region // ""] | @tsv
+            ' <<< "$addrs"
+        } > "${out}.tmp" 2>/dev/null || printf 'error\tCould not parse the API response\n' > "${out}.tmp"
+        # the rename is atomic, so the TUI never sees a half-written result
+        mv "${out}.tmp" "$out"
+    }
+
+    # A fetch takes about a second, or up to ten when the network is bad. So it
+    # runs in the background, and the key loop picks the result up when it is there.
+    start_fetch() {
+        if (( fetching )); then return 0; fi
+        fetching=1
+        rm -f "$result_file"
+        ( trap - EXIT; fetch_to_file "$result_file" ) < /dev/null > /dev/null 2>&1 &
+        fetch_pid=$!
+    }
+
+    # Loads a finished fetch into the TUI state. Returns 1 when there is none yet.
+    collect_fetch() {
+        if (( ! fetching )); then return 1; fi
+        if [[ ! -f "$result_file" ]]; then
+            # the fetch died without leaving a result: give up on it and retry later
+            if kill -0 "$fetch_pid" 2>/dev/null; then return 1; fi
+            if [[ ! -f "$result_file" ]]; then
+                wait "$fetch_pid" 2>/dev/null || true
+                fetching=0
+                next_fetch=$(( SECONDS + interval ))
+                error="Fetching from the ngrok API failed"
+                needs_redraw=1
+                return 0
+            fi
+        fi
+
+        local raw=()
+        mapfile -t raw < "$result_file"
+        rm -f "$result_file"
+        wait "$fetch_pid" 2>/dev/null || true
+        fetching=0
+        next_fetch=$(( SECONDS + interval ))
+        loaded=1
+
+        if [[ "${raw[0]:-}" == ok ]]; then
+            error=""
+            lines=("${raw[@]:1}")
+        else
+            # keep showing nothing rather than a list we know is out of date
+            error="${raw[0]#error$'\t'}"
+            error="${error:-Fetching from the ngrok API failed}"
+            lines=()
+        fi
 
         line_count=${#lines[@]}
         if (( sel >= line_count )); then
             sel=$(( line_count > 0 ? line_count - 1 : 0 ))
         fi
+        printf -v refreshed_at '%(%H:%M:%S)T' -1
+        load_ssh_map
+        refresh_labels
+        needs_redraw=1
+        return 0
+    }
+
+    refresh_labels() {
+        labels=()
+        local i desc addr
+        for (( i = 0; i < ${#lines[@]}; i++ )); do
+            IFS=$'\t' read -r _ desc addr _ <<< "${lines[$i]}"
+            ssh_label_for "$desc" "$addr"
+            labels[i]="$REPLY"
+        done
+    }
+
+    # What the SSH column shows: the alias that points at this address, or the
+    # expected alias marked as stale when it points somewhere else.
+    ssh_label_for() {
+        local desc="$1" addr="$2" alias
+        REPLY="${ssh_alias_by_addr[${addr,,}]:-}"
+        if [[ -n "$REPLY" ]]; then return 0; fi
+        ssh_alias_for "$desc"
+        alias="$REPLY"
+        REPLY=""
+        if [[ -n "$alias" && -n "${ssh_addr_by_alias[$alias]:-}" ]]; then
+            REPLY="${alias} (stale)"
+        fi
     }
 
     draw() {
         local buf=""
-        local cols
-        cols="$(tput cols)"
-        local ts
-        ts="$(date +%H:%M:%S)"
-        local header=" ngrok TCP Addresses  —  refreshed ${ts}  —  every ${interval}s "
+        if (( resized )); then
+            term_cols="$(tput cols)"
+            term_rows="$(tput lines)"
+            resized=0
+        fi
+        local cols=$term_cols rows=$term_rows
+        local header=" ngrok TCP Addresses  —  refreshed ${refreshed_at:-never}  —  every ${interval}s "
+        local padded
+        # every line is cut to the terminal width, because a wrapped line
+        # would throw off the row count that scrolling depends on
+        local width=$(( cols - 1 ))
 
-        buf+="$(tput rev; tput bold)"
-        buf+="$(printf "%-${cols}s" "$header")"
-        buf+="$(tput sgr0)"$'\n'
+        printf -v padded "%-${cols}s" "$header"
+        buf+="${t_rev}${t_bold}${padded:0:cols}${t_sgr0}"$'\n'
 
-        if [[ -n "$error" ]]; then
-            buf+=$'\n'"  $error"
+        if (( ! loaded )) && [[ -z "$error" ]]; then
+            buf+="${el}"$'\n'"  Loading…${el}"
+        elif [[ -n "$error" ]]; then
+            local msg="  ${error}"
+            buf+="${el}"$'\n'"${msg:0:width}${el}"
         elif [[ ${#lines[@]} -eq 0 ]]; then
-            buf+=$'\n'"  No TCP addresses found."
+            buf+="${el}"$'\n'"  No TCP addresses found.${el}"
         else
-            buf+=$'\n'
-            buf+="$(tput bold)"
-            buf+="$(printf "     %-30s  %-25s  %s" "DESCRIPTION" "ADDRESS" "REGION")"
-            buf+="$(tput sgr0)"$'\n'
-            buf+="$(printf " %s" "$(printf '─%.0s' $(seq 1 65))")"$'\n'
+            # 8 lines of the screen are taken up by the header and the footer
+            local visible=$(( rows - 8 ))
+            if (( visible < 1 )); then visible=1; fi
+            if (( sel < top )); then top=$sel; fi
+            if (( sel >= top + visible )); then top=$(( sel - visible + 1 )); fi
+            if (( top > line_count - visible )); then top=$(( line_count - visible )); fi
+            if (( top < 0 )); then top=0; fi
+            local last=$(( top + visible ))
+            if (( last > line_count )); then last=$line_count; fi
 
-            local i=0
-            for line in "${lines[@]}"; do
-                IFS=$'\t' read -r status desc addr region <<< "$line"
-                local row
-                if (( i == sel )); then
-                    if [[ "$status" == "●" ]]; then
-                        row="$(printf " \033[32m%-3s\033[0m\033[7m %-30s  %-25s  %s\033[0m\033[K" "$status" "$desc" "$addr" "$region")"
-                    else
-                        row="$(printf " \033[90m%-3s\033[0m\033[7m %-30s  %-25s  %s\033[0m\033[K" "$status" "$desc" "$addr" "$region")"
-                    fi
-                else
-                    if [[ "$status" == "●" ]]; then
-                        row="$(printf " \033[32m%-3s\033[0m %-30s  %-25s  %s\033[K" "$status" "$desc" "$addr" "$region")"
-                    else
-                        row="$(printf " \033[90m%-3s\033[0m %-30s  %-25s  %s\033[K" "$status" "$desc" "$addr" "$region")"
-                    fi
-                fi
-                buf+="${row}"$'\n'
-                (( i++ )) || true
+            local row rule
+            buf+="${el}"$'\n'
+            printf -v row "     %-30s  %-25s  %-6s  %s" "DESCRIPTION" "ADDRESS" "REGION" "SSH"
+            buf+="${t_bold}${row:0:width}${t_sgr0}${el}"$'\n'
+            printf -v rule '─%.0s' {1..81}
+            buf+=" ${rule:0:width - 1}${el}"$'\n'
+
+            local i status desc addr region label color rev
+            for (( i = top; i < last; i++ )); do
+                IFS=$'\t' read -r status desc addr region <<< "${lines[$i]}"
+                label="${labels[$i]:-}"
+                color=$'\e[90m'
+                if [[ "$status" == "●" ]]; then color=$'\e[32m'; fi
+                rev=""
+                if (( i == sel )); then rev=$'\e[7m'; fi
+                printf -v row " %-30.30s  %-25s  %-6s  %s" "$desc" "$addr" "$region" "$label"
+                row="${row:0:width > 4 ? width - 4 : 0}"
+                buf+=" ${color}${status}  "$'\e[0m'"${rev}${row}"$'\e[0m'"${el}"$'\n'
             done
 
-            buf+=$'\n'
-            buf+="$(tput dim)"
-            buf+=" ${#lines[@]} address(es)"
-            buf+="$(tput sgr0)"
+            buf+="${el}"$'\n'
+            local summary=" ${line_count} address(es)"
+            if (( line_count > visible )); then
+                summary+="  —  showing $(( top + 1 ))-${last}"
+            fi
+            buf+="${t_dim}${summary:0:width}${t_sgr0}${el}"
         fi
 
-        buf+=$'\n\n'
+        buf+=$'\n'"${el}"$'\n'
         # status message or help
         if [[ -n "$status_msg" ]] && (( SECONDS < status_expire )); then
-            buf+=" \033[33m${status_msg}\033[0m"
+            local shown=" ${status_msg}"
+            buf+=$'\e[33m'"${shown:0:width}"$'\e[0m'
         else
             status_msg=""
-            buf+="$(tput dim)"
-            buf+=" ↑/↓ navigate  c copy address  s copy ssh cmd  q quit"
-            buf+="$(tput sgr0)"
+            local help=" ↑/↓ navigate  c copy address  s copy ssh cmd  a add to ssh config  q quit"
+            buf+="${t_dim}${help:0:width}${t_sgr0}"
         fi
 
-        tput home
-        printf '%s' "$buf"
-        tput el; tput ed
+        # home, the frame, then clear whatever is left below it
+        printf '\e[H%s\e[K\e[J' "$buf"
     }
 
     set_status() {
@@ -241,34 +492,75 @@ watch_tui() {
         fi
     }
 
+    move_sel() {
+        local target=$(( sel + $1 ))
+        if (( target > line_count - 1 )); then target=$(( line_count - 1 )); fi
+        if (( target < 0 )); then target=0; fi
+        if (( target != sel )); then
+            sel=$target
+            needs_redraw=1
+        fi
+    }
+
+    page_size() {
+        local n=$(( term_rows - 9 ))
+        if (( n < 1 )); then n=1; fi
+        echo "$n"
+    }
+
+    add_to_ssh_config() {
+        if (( line_count == 0 )); then return 0; fi
+        local desc addr
+        IFS=$'\t' read -r _ desc addr _ <<< "${lines[$sel]}"
+        if [[ -z "$addr" ]]; then return 0; fi
+        local host="${addr%%:*}" port="${addr##*:}"
+
+        # suggest the alias that already points here, otherwise one made from the description
+        local suggestion="${ssh_alias_by_addr[${addr,,}]:-}"
+        if [[ -z "$suggestion" ]]; then
+            ssh_alias_for "$desc"
+            suggestion="$REPLY"
+        fi
+
+        local alias=""
+        tput cup $(( term_rows - 1 )) 0
+        tput el
+        tput cnorm
+        read -r -e -i "$suggestion" -p " Host alias (empty to cancel): " alias || alias=""
+        tput civis
+        needs_redraw=1
+
+        alias="${alias//[[:space:]]/}"
+        if [[ -z "$alias" ]]; then
+            set_status "Cancelled"
+            return 0
+        fi
+        if [[ ! "$alias" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            set_status "Invalid alias: ${alias}"
+            return 0
+        fi
+
+        local result
+        if result="$(ssh_config_upsert "$alias" "$host" "$port" "${ssh_user:-}" 2>/dev/null)"; then
+            load_ssh_map
+            refresh_labels
+            set_status "ssh config ${result}: ssh ${alias}"
+        else
+            set_status "Could not write $(ssh_config_path)"
+        fi
+    }
+
     handle_key() {
         local key="$1"
         case "$key" in
             q|Q) exit 0 ;;
-            A)  # up arrow (escape sequence: \e[A — \e and [ already consumed)
-                if (( sel > 0 )); then
-                    (( sel-- ))
-                    needs_redraw=1
-                fi
-                ;;
-            B)  # down arrow
-                if (( sel < line_count - 1 )); then
-                    (( sel++ )) || true
-                    needs_redraw=1
-                fi
-                ;;
-            k)  # vim up
-                if (( sel > 0 )); then
-                    (( sel-- ))
-                    needs_redraw=1
-                fi
-                ;;
-            j)  # vim down
-                if (( sel < line_count - 1 )); then
-                    (( sel++ )) || true
-                    needs_redraw=1
-                fi
-                ;;
+            UP|k)     move_sel -1 ;;
+            DOWN|j)   move_sel 1 ;;
+            PGUP)     move_sel "-$(page_size)" ;;
+            PGDN)     move_sel "$(page_size)" ;;
+            HOME|g)   move_sel "-${line_count}" ;;
+            END|G)    move_sel "${line_count}" ;;
+            a)        add_to_ssh_config ;;
             c|C)
                 local addr
                 addr="$(get_selected_addr)"
@@ -299,41 +591,68 @@ watch_tui() {
         esac
     }
 
+    # Reads the rest of an escape sequence (the \e is already consumed) and
+    # prints a key name, or nothing for sequences we do not use.
+    read_escape() {
+        local seq="" ch=""
+        while ch=""; read -rsn1 -t 0.05 ch 2>/dev/null || [[ -n "$ch" ]]; do
+            seq+="$ch"
+            if [[ "$seq" != "[" && "$seq" != "O" && "$ch" =~ [A-Za-z~] ]]; then break; fi
+        done
+        case "$seq" in
+            "[A"|"OA") echo UP ;;
+            "[B"|"OB") echo DOWN ;;
+            "[5~") echo PGUP ;;
+            "[6~") echo PGDN ;;
+            "[H"|"OH"|"[1~"|"[7~") echo HOME ;;
+            "[F"|"OF"|"[4~"|"[8~") echo END ;;
+        esac
+    }
+
     local lines=()
     local error=""
-    local response
+    local key
 
-    fetch_data
+    start_fetch
     draw
+    needs_redraw=0
 
     while true; do
-        # wait for interval, but check for keys every 0.2s
-        local waited=0
-        while (( waited < interval * 5 )); do
-            if read -rsn1 -t 0.2 key 2>/dev/null; then
+        # on a timeout bash may still hand us a byte it had already read
+        key=""
+        if read -rsn1 -t 0.2 key 2>/dev/null || [[ -n "$key" ]]; then
+            if [[ "$key" == $'\x1b' ]]; then
+                key="$(read_escape)"
+            fi
+            handle_key "$key"
+            # A held key queues up repeats faster than we can draw. Take
+            # everything that is waiting first, then draw once.
+            # (read -t 0 only tests for input, so no byte can be lost
+            # to a timeout that fires in the middle of a read)
+            while read -t 0 2>/dev/null; do
+                read -rsn1 key 2>/dev/null || break
                 if [[ "$key" == $'\x1b' ]]; then
-                    # read rest of escape sequence
-                    read -rsn2 -t 0.05 seq 2>/dev/null || true
-                    key="${seq: -1}"
+                    key="$(read_escape)"
                 fi
                 handle_key "$key"
-                if (( needs_redraw )); then
-                    draw
-                    needs_redraw=0
-                fi
-            fi
-            (( waited++ )) || true
-            # clear expired status messages
-            if [[ -n "$status_msg" ]] && (( SECONDS >= status_expire )); then
-                status_msg=""
-                draw
-            fi
-        done
+            done
+        fi
 
-        fetch_data
-        needs_redraw=1
-        draw
-        needs_redraw=0
+        if (( fetching )); then
+            collect_fetch || true
+        elif (( SECONDS >= next_fetch )); then
+            start_fetch
+        fi
+
+        # clear expired status messages
+        if [[ -n "$status_msg" ]] && (( SECONDS >= status_expire )); then
+            status_msg=""
+            needs_redraw=1
+        fi
+        if (( needs_redraw )); then
+            draw
+            needs_redraw=0
+        fi
     done
 }
 
@@ -348,11 +667,14 @@ Commands:
   config set <key> <val> Set a config value
   config get [key]       Show config values
   config path            Print config file path
+  version                Print the version
 
 Config keys:
   api_key                Your ngrok API key
   refresh_interval       Refresh interval in seconds (default: 5)
-  ssh_user               Default SSH username for the 's' shortcut
+  ssh_user               Default SSH username for the 's' shortcut and new ssh config entries
+  ssh_config             ssh config file to edit (default: ~/.ssh/config)
+  alias_strip_prefix     Prefix dropped from the description when suggesting a Host alias
 EOF
 }
 
@@ -380,6 +702,9 @@ case "${1:-watch}" in
         ;;
     -h|--help|help)
         usage
+        ;;
+    -v|--version|version)
+        echo "ngrok-status ${VERSION}"
         ;;
     *)
         usage
