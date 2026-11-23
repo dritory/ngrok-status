@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 CONFIG_DIR="${HOME}/.config/ngrok-status"
 CONFIG_FILE="${CONFIG_DIR}/config"
 ADDRS_URL="https://api.ngrok.com/reserved_addrs"
 ENDPOINTS_URL="https://api.ngrok.com/endpoints"
+# where the published script and installer live (overridable for testing)
+RAW_BASE="${NGROK_STATUS_RAW_BASE:-https://raw.githubusercontent.com/dritory/ngrok-status/main}"
+UPDATE_CHECK_EVERY=$(( 6 * 3600 ))  # seconds between checks while the TUI runs
 
 # --- clipboard helper ---
 
@@ -79,6 +82,34 @@ get_api_key() {
         exit 1
     fi
     echo "$key"
+}
+
+# --- update helpers ---
+
+# Prints the version of the published script, or nothing if it cannot be reached.
+latest_version() {
+    curl -fsSL --max-time 5 "${RAW_BASE}/ngrok-status" 2>/dev/null \
+        | sed -n 's/^VERSION="\([0-9][0-9A-Za-z.-]*\)"$/\1/p' | head -n 1
+}
+
+# True when version $1 is newer than version $2.
+version_gt() {
+    [[ "$1" != "$2" ]] || return 1
+    [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" == "$1" ]]
+}
+
+self_update() {
+    local installer
+    installer="$(mktemp)"
+    if ! curl -fsSL --max-time 30 "${RAW_BASE}/install.sh" -o "$installer"; then
+        rm -f "$installer"
+        echo "Error: could not download the installer from ${RAW_BASE}/install.sh" >&2
+        exit 1
+    fi
+    local rc=0
+    bash "$installer" || rc=$?
+    rm -f "$installer"
+    exit "$rc"
 }
 
 # --- ssh config helpers ---
@@ -226,9 +257,12 @@ watch_tui() {
     tmp_dir="$(mktemp -d)"
     local result_file="${tmp_dir}/result"
     local fetching=0 fetch_pid="" next_fetch=0 loaded=0
+    local update_file="${tmp_dir}/latest"
+    local update_pid="" next_update_check=0 update_notice=""
 
     cleanup() {
         if [[ -n "$fetch_pid" ]]; then kill "$fetch_pid" 2>/dev/null || true; fi
+        if [[ -n "$update_pid" ]]; then kill "$update_pid" 2>/dev/null || true; fi
         rm -rf "$tmp_dir"
         tput cnorm; tput sgr0; echo
     }
@@ -377,6 +411,39 @@ watch_tui() {
         return 0
     }
 
+    # Looks up the published version in the background, like the fetch above,
+    # so that a slow or missing network never holds up the TUI.
+    check_for_update() {
+        if [[ "${check_updates:-true}" == false ]]; then return 0; fi
+        if [[ -n "$update_pid" ]]; then
+            if [[ ! -f "$update_file" ]]; then
+                if kill -0 "$update_pid" 2>/dev/null; then return 0; fi
+                if [[ ! -f "$update_file" ]]; then
+                    wait "$update_pid" 2>/dev/null || true
+                    update_pid=""
+                    return 0
+                fi
+            fi
+            local latest=""
+            read -r latest < "$update_file" || true
+            rm -f "$update_file"
+            wait "$update_pid" 2>/dev/null || true
+            update_pid=""
+            if [[ -n "$latest" ]] && version_gt "$latest" "$VERSION"; then
+                update_notice="Version ${latest} is available (you have ${VERSION}). To update, quit and run: ngrok-status update"
+                needs_redraw=1
+            fi
+        elif (( SECONDS >= next_update_check )); then
+            next_update_check=$(( SECONDS + UPDATE_CHECK_EVERY ))
+            (
+                trap - EXIT
+                latest_version > "${update_file}.tmp" || true
+                mv "${update_file}.tmp" "$update_file"
+            ) < /dev/null > /dev/null 2>&1 &
+            update_pid=$!
+        fi
+    }
+
     refresh_labels() {
         labels=()
         local i desc addr
@@ -418,13 +485,20 @@ watch_tui() {
         printf -v padded "%-${cols}s" "$header"
         buf+="${t_rev}${t_bold}${padded:0:cols}${t_sgr0}"$'\n'
 
+        # the line under the header is normally blank; it carries the update notice
+        if [[ -n "$update_notice" ]]; then
+            local notice=" ${update_notice}"
+            buf+=$'\e[33m'"${notice:0:width}"$'\e[0m'
+        fi
+        buf+="${el}"$'\n'
+
         if (( ! loaded )) && [[ -z "$error" ]]; then
-            buf+="${el}"$'\n'"  Loading…${el}"
+            buf+="  Loading…${el}"
         elif [[ -n "$error" ]]; then
             local msg="  ${error}"
-            buf+="${el}"$'\n'"${msg:0:width}${el}"
+            buf+="${msg:0:width}${el}"
         elif [[ ${#lines[@]} -eq 0 ]]; then
-            buf+="${el}"$'\n'"  No TCP addresses found.${el}"
+            buf+="  No TCP addresses found.${el}"
         else
             # 8 lines of the screen are taken up by the header and the footer
             local visible=$(( rows - 8 ))
@@ -437,7 +511,6 @@ watch_tui() {
             if (( last > line_count )); then last=$line_count; fi
 
             local row rule
-            buf+="${el}"$'\n'
             printf -v row "     %-30s  %-25s  %-6s  %s" "DESCRIPTION" "ADDRESS" "REGION" "SSH"
             buf+="${t_bold}${row:0:width}${t_sgr0}${el}"$'\n'
             printf -v rule '─%.0s' {1..81}
@@ -643,6 +716,7 @@ watch_tui() {
         elif (( SECONDS >= next_fetch )); then
             start_fetch
         fi
+        check_for_update
 
         # clear expired status messages
         if [[ -n "$status_msg" ]] && (( SECONDS >= status_expire )); then
@@ -667,7 +741,8 @@ Commands:
   config set <key> <val> Set a config value
   config get [key]       Show config values
   config path            Print config file path
-  version                Print the version
+  update                 Install the latest version over this one
+  version                Print the version, and whether a newer one exists
 
 Config keys:
   api_key                Your ngrok API key
@@ -675,6 +750,7 @@ Config keys:
   ssh_user               Default SSH username for the 's' shortcut and new ssh config entries
   ssh_config             ssh config file to edit (default: ~/.ssh/config)
   alias_strip_prefix     Prefix dropped from the description when suggesting a Host alias
+  check_updates          Set to false to stop the TUI from checking for new versions
 EOF
 }
 
@@ -705,6 +781,16 @@ case "${1:-watch}" in
         ;;
     -v|--version|version)
         echo "ngrok-status ${VERSION}"
+        config_load
+        if [[ "${check_updates:-true}" != false ]]; then
+            latest="$(latest_version || true)"
+            if [[ -n "$latest" ]] && version_gt "$latest" "$VERSION"; then
+                echo "Version ${latest} is available. To update, run: ngrok-status update"
+            fi
+        fi
+        ;;
+    update)
+        self_update
         ;;
     *)
         usage
