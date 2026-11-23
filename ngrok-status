@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 CONFIG_DIR="${HOME}/.config/ngrok-status"
 CONFIG_FILE="${CONFIG_DIR}/config"
 ADDRS_URL="https://api.ngrok.com/reserved_addrs"
@@ -476,7 +476,10 @@ watch_tui() {
             resized=0
         fi
         local cols=$term_cols rows=$term_rows
-        local header=" ngrok TCP Addresses  —  refreshed ${refreshed_at:-never}  —  every ${interval}s "
+        local header=" ngrok TCP Addresses  —  refreshed ${refreshed_at}  —  every ${interval}s "
+        if [[ -z "$refreshed_at" ]]; then
+            header=" ngrok TCP Addresses  —  every ${interval}s "
+        fi
         local padded
         # every line is cut to the terminal width, because a wrapped line
         # would throw off the row count that scrolling depends on
