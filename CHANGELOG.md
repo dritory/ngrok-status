@@ -24,8 +24,9 @@
 
 ### Upgrading
 
-- An existing config file needs no changes and is not rewritten. A file edited by 0.4.0 can still be read by older versions.
-- Shell code in the config file (for example `api_key=$(pass show ngrok)`) is no longer run. The tool reports such a line and ignores it. Use the `NGROK_API_KEY` environment variable for that.
+- An existing config file needs no changes and is not rewritten. Lines are read the way bash read them, so a comment after a value still works. A file edited by 0.4.0 can still be read by older versions.
+- Shell code in the config file (for example `api_key=$(pass show ngrok)`) is no longer run. The tool reports such a line and ignores it, and the setup screen says so before it asks for a key. Use the `NGROK_API_KEY` environment variable for that.
+- A path that starts with `~` is stored as the full path, because older versions do not expand it.
 
 ### Fixed
 

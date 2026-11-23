@@ -65,6 +65,7 @@ config_describe() {
         ssh_config)
             CFG_LABEL="SSH config file"
             CFG_HELP="The ssh config file that 'a' edits, and that the SSH column is read from."
+            # shellcheck disable=SC2088
             CFG_DEFAULT="~/.ssh/config" ;;
         alias_strip_prefix)
             CFG_LABEL="Alias prefix"
@@ -105,8 +106,8 @@ config_validate() {
                 REPLY="the refresh interval must be a whole number of seconds, 1 or more"; return 1
             fi ;;
         ssh_user)
-            if [[ ! "$value" =~ ^[A-Za-z0-9._-]+$ ]]; then
-                REPLY="the SSH user can only contain letters, digits, dots, dashes and underscores"; return 1
+            if [[ ! "$value" =~ ^[^[:space:]]+$ ]]; then
+                REPLY="the SSH user cannot be empty or contain spaces"; return 1
             fi ;;
         ssh_config)
             if [[ -z "$value" ]]; then REPLY="the path cannot be empty"; return 1; fi ;;
@@ -123,9 +124,16 @@ config_validate() {
 }
 
 # Splits one line of the config file into CFG_KEY and CFG_VALUE.
-# Returns 1 for blank lines and comments, 2 for anything that is not key=value.
+# Returns 1 for blank lines and comments, and 2 for a line that is not a
+# plain setting. In the last case CFG_KEY is still set if the line names one.
+#
+# Old versions ran the file through bash, so a line is read the way bash
+# would read a simple assignment: an unquoted value ends at the first space,
+# a quoted value ends at its closing quote, and a # after that starts a
+# comment. Anything bash would have had to evaluate is not a plain setting.
 config_parse_line() {
-    local line="$1" key value first last
+    local line="$1" key value rest="" quote
+    local needs_shell='[][;|&<>(){}*?!~"'"'"'\\]'
     CFG_KEY=""; CFG_VALUE=""
     line="${line%$'\r'}"
     line="${line#"${line%%[![:space:]]*}"}"
@@ -139,16 +147,31 @@ config_parse_line() {
     value="${line#*=}"
     key="${key%"${key##*[![:space:]]}"}"
     if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then return 2; fi
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%"${value##*[![:space:]]}"}"
-    # one pair of surrounding quotes is part of the syntax, not of the value
-    if (( ${#value} >= 2 )); then
-        first="${value:0:1}"; last="${value: -1}"
-        if [[ "$first" == "$last" && ( "$first" == '"' || "$first" == "'" ) ]]; then
-            value="${value:1:${#value}-2}"
-        fi
-    fi
     CFG_KEY="$key"
+    value="${value#"${value%%[![:space:]]*}"}"
+
+    if [[ "$value" == \"* || "$value" == \'* ]]; then
+        quote="${value:0:1}"
+        value="${value:1}"
+        if [[ "$value" != *"$quote"* ]]; then return 2; fi  # never closed
+        rest="${value#*"$quote"}"
+        value="${value%%"$quote"*}"
+        # inside double quotes bash would expand these
+        if [[ "$quote" == '"' && "$value" == *[\\\$\`]* ]]; then return 2; fi
+    else
+        rest="${value#"${value%%[[:space:]]*}"}"
+        value="${value%%[[:space:]]*}"
+        # a leading ~/ is the one thing we expand ourselves (see ssh_config_path)
+        local probe="$value"
+        # shellcheck disable=SC2088
+        if [[ "$probe" == "~/"* ]]; then probe="${probe:1}"; fi
+        if [[ "$probe" == *[\$\`]* || "$probe" =~ $needs_shell ]]; then return 2; fi
+    fi
+
+    # what follows the value must be nothing, or a comment set off by a space
+    if [[ -n "$rest" && "$rest" != [[:space:]]* ]]; then return 2; fi
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    if [[ -n "$rest" && "$rest" != \#* ]]; then return 2; fi
     CFG_VALUE="$value"
     return 0
 }
@@ -167,13 +190,13 @@ config_load() {
             chmod 600 "$CONFIG_FILE" 2>/dev/null || true
         fi
 
-        local line n=0 rc shell_code='[$`]'
+        local line n=0 rc
         while IFS= read -r line || [[ -n "$line" ]]; do
             (( n++ )) || true
             rc=0
             config_parse_line "$line" || rc=$?
             if (( rc == 1 )); then continue; fi
-            if (( rc == 2 )); then
+            if (( rc == 2 )) && [[ -z "$CFG_KEY" ]]; then
                 CONFIG_WARNINGS+=("line ${n} of the config file is not a key=value setting, so it is ignored")
                 continue
             fi
@@ -181,8 +204,8 @@ config_load() {
                 CONFIG_WARNINGS+=("line ${n} of the config file sets the unknown key '${CFG_KEY}', so it is ignored")
                 continue
             fi
-            if [[ "$CFG_VALUE" =~ $shell_code ]]; then
-                CONFIG_WARNINGS+=("${CFG_KEY} (line ${n} of the config file) looks like shell code, which is no longer run. Set it again with: ngrok-status config set ${CFG_KEY} <value>")
+            if (( rc == 2 )); then
+                CONFIG_WARNINGS+=("${CFG_KEY} (line ${n} of the config file) looks like shell code, which is no longer run, so it is ignored. Set it again with: ngrok-status config set ${CFG_KEY} <value>")
                 continue
             fi
             printf -v "$CFG_KEY" '%s' "$CFG_VALUE"
@@ -218,7 +241,13 @@ config_write() {
     mkdir -p "$CONFIG_DIR" || return 1
     if [[ -L "$target" ]]; then
         # keep a symlinked config (dotfiles) a symlink: replace what it points at
-        target="$(readlink -f "$target")" || return 1
+        local link
+        if ! link="$(readlink -f "$target" 2>/dev/null)"; then
+            # readlink without -f (older macOS) gives the link text as it is
+            link="$(readlink "$target")" || return 1
+            if [[ "$link" != /* ]]; then link="$(dirname "$target")/${link}"; fi
+        fi
+        target="$link"
     fi
     dir="$(dirname "$target")"
     tmp="$(umask 077; mktemp "${dir}/.config.XXXXXX")" || return 1
@@ -228,7 +257,7 @@ config_write() {
             while IFS= read -r line || [[ -n "$line" ]]; do
                 rc=0
                 config_parse_line "$line" || rc=$?
-                if (( rc == 0 )) && [[ "$CFG_KEY" == "$key" ]]; then
+                if (( rc != 1 )) && [[ "$CFG_KEY" == "$key" ]]; then
                     # the first occurrence is replaced, repeats are dropped
                     if (( ! written )) && [[ -n "$value" ]]; then
                         printf '%s="%s"\n' "$key" "$value"
@@ -247,6 +276,20 @@ config_write() {
     chmod 600 "$tmp" && mv "$tmp" "$target" || { rm -f "$tmp"; return 1; }
 }
 
+# Tidies a value before it is checked and saved. The result is left in REPLY.
+config_normalize() {
+    local key="$1" value="$2"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    # Versions before 0.4.0 do not expand ~ in this path, so the full path is
+    # what goes into the file. That way every version reads the same thing.
+    # shellcheck disable=SC2088
+    if [[ "$key" == ssh_config && ( "$value" == "~" || "$value" == "~/"* ) ]]; then
+        value="${HOME}${value:1}"
+    fi
+    REPLY="$value"
+}
+
 # "abcd***wxyz", so that a key can be recognised without being shown
 mask_secret() {
     local v="$1"
@@ -259,8 +302,8 @@ mask_secret() {
 
 config_set() {
     local key="$1" value="$2"
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%"${value##*[![:space:]]}"}"
+    config_normalize "$key" "$value"
+    value="$REPLY"
     if ! config_validate "$key" "$value"; then
         echo "Error: ${REPLY}" >&2
         return 1
@@ -402,7 +445,7 @@ setup_ask() {
 # The first-run screen, also reachable as `ngrok-status setup`. It gets a
 # working API key into the config file and offers the two ssh settings.
 run_setup() {
-    local first_run="${1:-0}" current key answer rc prefix
+    local first_run="${1:-0}" current key answer rc prefix keeping w
     config_load
     current="${api_key:-}"
 
@@ -418,21 +461,42 @@ run_setup() {
     echo "  Note that an API key is not the authtoken that the ngrok agent uses."
     echo "  What you paste is not shown on screen."
     echo
+    if (( ${#CONFIG_WARNINGS[@]} )); then
+        # Without this, someone whose api_key line was shell code would land
+        # here with no idea why the tool forgot their key.
+        echo "  Your config file has lines that this version does not use:"
+        for w in "${CONFIG_WARNINGS[@]}"; do
+            echo "    - ${w}" | fold -s -w 76 | sed '2,$s/^/      /'
+        done
+        echo "  If your API key comes from a command, quit here and put it in the"
+        echo "  NGROK_API_KEY environment variable. A key that you enter below is"
+        echo "  written to the config file as plain text, in place of that line."
+        echo
+    fi
 
     while true; do
         key=""
+        keeping=0
+        rc=0
         if [[ -n "$current" ]]; then
             mask_secret "$current"
-            read -r -s -p "  API key (Enter keeps ${REPLY}): " key || key=""
+            read -r -s -p "  API key (Enter keeps ${REPLY}): " key || rc=$?
         else
-            read -r -s -p "  API key (Enter to quit): " key || key=""
+            read -r -s -p "  API key (Enter to quit): " key || rc=$?
         fi
         echo
+        if (( rc != 0 )); then
+            # end of input (Ctrl-D): there is nobody left to ask
+            echo
+            echo "  Setup cancelled. Nothing was saved."
+            return 1
+        fi
         key="${key//[[:space:]]/}"
 
         if [[ -z "$key" ]]; then
             if [[ -n "$current" ]]; then
                 key="$current"
+                keeping=1
             else
                 echo
                 echo "  Setup cancelled. Nothing was saved."
@@ -456,6 +520,11 @@ run_setup() {
             break
         fi
         echo "  That did not work: ${REPLY}."
+        if (( keeping )); then
+            # the key was already there, so there is nothing to refuse to save
+            echo "  The current key is kept. Run setup again to replace it."
+            break
+        fi
         if (( rc == 2 )); then
             answer=""
             read -r -p "  Save the key anyway, without checking it? [y/N] " answer || answer=""
@@ -490,6 +559,10 @@ run_setup() {
         echo "  With ${prefix}, an address called ${prefix}example gets the alias example."
     fi
     setup_ask alias_strip_prefix "Alias prefix to drop" "$prefix"
+
+    # the file has changed, so what was reported about it may no longer hold
+    CONFIG_LOADED=0
+    config_load
 
     echo
     echo "  Saved to ${CONFIG_FILE}"
@@ -533,7 +606,8 @@ self_update() {
 
 ssh_config_path() {
     local path="${ssh_config:-${HOME}/.ssh/config}"
-    # the config file is no longer run by a shell, so ~ is expanded here
+    # a path typed into the file by hand may start with ~, which no shell expands for us
+    # shellcheck disable=SC2088
     if [[ "$path" == "~" || "$path" == "~/"* ]]; then
         path="${HOME}${path:1}"
     fi
@@ -673,6 +747,7 @@ watch_tui() {
             run_setup 1 || exit 1
             token="${api_key:-}"
         else
+            config_print_warnings
             echo "Error: ngrok API key not configured." >&2
             echo "Run:  ngrok-status setup" >&2
             exit 1
@@ -1112,15 +1187,28 @@ watch_tui() {
         fi
     }
 
+    # Drops a fetch that is under way, so that the next one starts at once.
+    # Its result would be for the old key, and collecting it would also push
+    # the next fetch a whole interval into the future.
+    restart_fetch() {
+        if (( fetching )); then
+            kill "$fetch_pid" 2>/dev/null || true
+            wait "$fetch_pid" 2>/dev/null || true
+            fetching=0
+        fi
+        rm -f "$result_file"
+        next_fetch=0
+    }
+
     # Makes a changed setting take effect in the running TUI.
     apply_setting() {
         case "$1" in
             api_key)
                 token="${NGROK_API_KEY:-${api_key:-}}"
-                next_fetch=0 ;;
+                restart_fetch ;;
             refresh_interval)
                 interval="${refresh_interval:-5}"
-                next_fetch=0 ;;
+                restart_fetch ;;
             ssh_config|alias_strip_prefix)
                 load_ssh_map
                 refresh_labels ;;
@@ -1177,8 +1265,8 @@ watch_tui() {
             value="${value//[[:space:]]/}"
         else
             read -r -e -i "$current" -p " ${CFG_LABEL} (clear the line for the default): " value || value="$current"
-            value="${value#"${value%%[![:space:]]*}"}"
-            value="${value%"${value##*[![:space:]]}"}"
+            config_normalize "$key" "$value"
+            value="$REPLY"
         fi
         tput civis
         needs_redraw=1
@@ -1310,8 +1398,10 @@ watch_tui() {
     local error=""
     local key got_key
 
-    if (( ${#CONFIG_WARNINGS[@]} )); then
+    if (( ${#CONFIG_WARNINGS[@]} == 1 )); then
         set_status "${CONFIG_WARNINGS[0]}" 15
+    elif (( ${#CONFIG_WARNINGS[@]} > 1 )); then
+        set_status "The config file has ${#CONFIG_WARNINGS[@]} problems. To see them, quit and run: ngrok-status config get" 15
     fi
 
     start_fetch

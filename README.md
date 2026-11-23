@@ -71,7 +71,7 @@ The settings live in `~/.config/ngrok-status/config`, as `key="value"` lines tha
 
 There is nothing to do. Your existing config file is read as it is and is not rewritten. The first time 0.4.0 sees the file, it makes it readable by you only, since it holds your API key and older versions left it readable by other users on the machine.
 
-Older versions ran the config file as a bash script. If you had put shell code in it by hand (for example `api_key=$(pass show ngrok)`), that line is now ignored and the tool tells you which line it was. Use the `NGROK_API_KEY` environment variable for that case.
+Older versions ran the config file as a bash script. If you had put shell code in it by hand (for example `api_key=$(pass show ngrok)`), that line is now ignored and the tool tells you which line it was, also on the setup screen that appears when the key is the line in question. Use the `NGROK_API_KEY` environment variable for that case.
 
 ### ssh config
 

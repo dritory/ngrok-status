@@ -53,6 +53,26 @@ check "the last duplicate wins, as in bash" "ssh_user = b"            "$(get ssh
 fresh 'api_key=noeol'
 check "file without a final newline"     "api_key = ***"              "$(get api_key)"
 
+# bash stopped an unquoted value at the first space and a quoted one at its
+# closing quote, and a # after that was a comment
+fresh $'api_key="abcd1234efgh5678" # from the dashboard\nssh_user=pi # user\nrefresh_interval=10   # seconds\ncheck_updates="false" # no network here\nalias_strip_prefix=\'bv-\'#x\n'
+out="$("$tool" config get 2>&1)"
+check "comment after a quoted value"     "api_key = abcd***5678"      "$(get api_key)"
+check "comment after an unquoted value"  "ssh_user = pi"              "$(get ssh_user)"
+check "comment after a number"           "refresh_interval = 10"      "$(get refresh_interval)"
+check "comment after a quoted boolean"   "check_updates = false"      "$(get check_updates)"
+check "text glued to a closing quote is not a plain value" "alias_strip_prefix = <unset>" "$(get alias_strip_prefix)"
+check "and that is the only warning"     "1"   "$(grep -c '^Warning' <<< "$out")"
+
+fresh $'ssh_user=\'pi\' ; alias_strip_prefix=bv-\napi_key="never closed\nrefresh_interval=1 0\nssh_config=~/alt/config\n'
+out="$("$tool" config get 2>&1)"
+check "two commands on a line are not a value" "ssh_user = <unset>"   "$(get ssh_user)"
+check "nor do they set the second key"   "alias_strip_prefix = <unset>" "$(get alias_strip_prefix)"
+check "an unclosed quote is not a value" "api_key = <unset>"          "$(get api_key)"
+check "an unquoted value with a space is not a value" "refresh_interval = 5 (default)" "$(get refresh_interval)"
+check "an unquoted ~/ path is kept"      "ssh_config = ~/alt/config"  "$(get ssh_config)"
+check "each of the three is reported"    "3"   "$(grep -c 'looks like shell code' <<< "$out")"
+
 # --- nothing in the file is ever executed ---
 
 fresh $'api_key="$(touch '"${work}"$'/pwned1)"\nssh_user=`touch '"${work}"$'/pwned2`\ntouch '"${work}"$'/pwned3\nalias_strip_prefix="ok-"\nrefresh_interval=$((1+1))\n'
@@ -108,6 +128,18 @@ done
 "$tool" config set 'x;touch '"${work}"'/pwned4' 1 >/dev/null 2>&1
 check "a hostile key name is not run"    "no"  "$([[ -e ${work}/pwned4 ]] && echo yes || echo no)"
 check "rejected values leave the file alone" "api_key=keep"           "$(cat "$cfg")"
+
+fresh $'ssh_user=$(whoami)\napi_key=keep\n'
+"$tool" config set ssh_user pi >/dev/null
+check "set replaces a line that was shell code" $'ssh_user="pi"\napi_key=keep' "$(cat "$cfg")"
+"$tool" config set ssh_user 'jdoe@corp.example' >/dev/null
+check "a user name with a domain is accepted" "ssh_user = jdoe@corp.example" "$(get ssh_user)"
+
+# old versions do not expand ~, so the full path is what gets stored
+# shellcheck disable=SC2088
+"$tool" config set ssh_config '~/.ssh/other' >/dev/null
+check "a ~ path is stored expanded"      "ssh_config=\"${HOME}/.ssh/other\"" "$(grep '^ssh_config' "$cfg")"
+check "so an old version reads the same path" "${HOME}/.ssh/other" "$(bash -c 'source "$1"; echo "$ssh_config"' _ "$cfg")"
 
 "$tool" config set ssh_config '/tmp/my ssh/config' >/dev/null
 check "a path with a space round-trips"  "ssh_config = /tmp/my ssh/config" "$(get ssh_config)"
